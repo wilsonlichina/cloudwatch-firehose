@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for CloudWatch Metric Streams to Kinesis Firehose with HTTP endpoint destination'
+
+Parameters:
+  LambdaS3Bucket:
+    Type: String
+    Description: 'S3 bucket containing Lambda function code'
+    
+  LambdaS3Key:
+    Type: String
+    Description: 'S3 key for the Lambda function code (e.g., lambda/record_processor.zip)'
+    Default: 'lambda/record_processor.zip'
+    
+  HttpEndpointLambdaS3Key:
+    Type: String
+    Description: 'S3 key for the HTTP endpoint Lambda function code'
+    Default: 'lambda/http_endpoint.zip'
+
+Resources:
+  # IAM Role for CloudWatch Metric Stream
+  MetricStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: streams.metrics.cloudwatch.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: MetricStreamPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                Resource: !GetAtt DeliveryStream.Arn
+
+  # S3 Bucket for Firehose backup
+  FirehoseBackupBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FirehoseBackupBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref FirehoseBackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !GetAtt FirehoseBackupBucket.Arn
+              - !Sub '${FirehoseBackupBucket.Arn}/*'
+
+  # IAM Role for Lambda Processor
+  LambdaProcessorRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::${LambdaS3Bucket}/*'
+
+  FirehoseRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: FirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:PutLogEvents'
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*'
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !GetAtt FirehoseBackupBucket.Arn
+                  - !Sub '${FirehoseBackupBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                Resource: !GetAtt RecordProcessor.Arn
+
+  # API Gateway REST API
+  MetricsApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub '${AWS::StackName}-metrics-api'
+      Description: 'API for receiving CloudWatch metrics'
+
+  # API Gateway Resource
+  MetricsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref MetricsApi
+      ParentId: !GetAtt MetricsApi.RootResourceId
+      PathPart: 'metrics'
+
+  # API Gateway Method
+  MetricsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref MetricsApi
+      ResourceId: !Ref MetricsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HttpEndpoint.Arn}/invocations'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: MetricsMethod
+    Properties:
+      RestApiId: !Ref MetricsApi
+
+  # API Gateway Stage
+  ApiStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref MetricsApi
+      StageName: 'prod'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: true
+          LoggingLevel: INFO
+
+  # Lambda Permission for API Gateway
+  ApiGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref HttpEndpoint
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MetricsApi}/*'
+
+  # HTTP Endpoint Lambda Function
+  HttpEndpoint:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: 
+      - HttpEndpointRole
+    Properties:
+      Handler: http_endpoint.lambda_handler
+      Role: !GetAtt HttpEndpointRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref HttpEndpointLambdaS3Key
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 128
+
+  # IAM Role for HTTP Endpoint Lambda
+  HttpEndpointRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda Function for Record Processing
+  RecordProcessor:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: 
+      - LambdaProcessorRole
+    Properties:
+      Handler: record_processor.lambda_handler
+      Role: !GetAtt LambdaProcessorRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 128
+
+  # Kinesis Firehose Delivery Stream
+  DeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    DependsOn:
+      - FirehoseRole
+      - FirehoseBackupBucket
+      - FirehoseBackupBucketPolicy
+      - RecordProcessor
+      - ApiStage
+    Properties:
+      DeliveryStreamType: DirectPut
+      HttpEndpointDestinationConfiguration:
+        EndpointConfiguration:
+          Url: !Sub 'https://${MetricsApi}.execute-api.${AWS::Region}.amazonaws.com/prod/metrics'
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        RoleARN: !GetAtt FirehoseRole.Arn
+        RetryOptions:
+          DurationInSeconds: 300
+        RequestConfiguration:
+          ContentEncoding: NONE
+          CommonAttributes: []
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt RecordProcessor.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: '/aws/kinesisfirehose/metric-stream'
+          LogStreamName: 'HttpEndpointDelivery'
+        S3BackupMode: 'FailedDataOnly'
+        S3Configuration:
+          BucketARN: !GetAtt FirehoseBackupBucket.Arn
+          BufferingHints:
+            IntervalInSeconds: 300
+            SizeInMBs: 5
+          CompressionFormat: UNCOMPRESSED
+          RoleARN: !GetAtt FirehoseRole.Arn
+
+  # CloudWatch Metric Stream
+  MetricStream:
+    Type: 'AWS::CloudWatch::MetricStream'
+    Properties:
+      Name: !Sub '${AWS::StackName}-metric-stream'
+      OutputFormat: json
+      FirehoseArn: !GetAtt DeliveryStream.Arn
+      RoleArn: !GetAtt MetricStreamRole.Arn
+      IncludeFilters:
+        - Namespace: AWS/EC2
+        - Namespace: AWS/Lambda
+        - Namespace: AWS/RDS
+
+Outputs:
+  MetricStreamArn:
+    Description: 'ARN of the CloudWatch Metric Stream'
+    Value: !GetAtt MetricStream.Arn
+  
+  FirehoseArn:
+    Description: 'ARN of the Kinesis Firehose Delivery Stream'
+    Value: !GetAtt DeliveryStream.Arn
+
+  FirehoseBackupBucketName:
+    Description: 'Name of the S3 bucket for Firehose backup'
+    Value: !Ref FirehoseBackupBucket
+
+  ApiEndpoint:
+    Description: 'URL of the API Gateway endpoint'
+    Value: !Sub 'https://${MetricsApi}.execute-api.${AWS::Region}.amazonaws.com/prod/metrics'
