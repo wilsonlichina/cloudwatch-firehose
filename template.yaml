@@ -288,8 +288,8 @@ Resources:
       RoleArn: !GetAtt MetricStreamRole.Arn
       IncludeFilters:
         - Namespace: AWS/EC2
-        - Namespace: AWS/Lambda
         - Namespace: AWS/RDS
+        - Namespace: AWS/Lambda
 
 Outputs:
   MetricStreamArn:

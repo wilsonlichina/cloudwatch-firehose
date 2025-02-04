@@ -182,8 +182,8 @@ aws cloudformation describe-stacks \
 
 1. 查看Lambda日志 (View Lambda Logs):
    ```bash
-   aws logs tail /aws/lambda/[stack-name]-record-processor
-   aws logs tail /aws/lambda/[stack-name]-http-endpoint
+   aws logs tail /AWS/Lambda/[stack-name]-record-processor
+   aws logs tail /AWS/Lambda/[stack-name]-http-endpoint
    ```
 
 2. 检查Firehose传输 (Check Firehose Delivery):
